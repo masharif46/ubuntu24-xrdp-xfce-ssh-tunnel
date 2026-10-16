@@ -5,6 +5,9 @@
 # Each run backs up configuration and restarts XRDP; log out of RDP first.
 # A small recovery timer restarts only the XRDP frontend after a failed
 # reconnect, preserving the underlying Xorg/XFCE session where possible.
+# needrestart is also told not to restart XRDP services automatically during
+# unrelated package installations; updates are picked up after a reboot or a
+# deliberate maintenance-window restart.
 # No changes to SSH, firewalld, display managers, or users' home directories.
 # No distribution upgrade, apt autoremove, or removal of installed packages.
 # Reference: https://manpages.ubuntu.com/manpages/noble/man5/xrdp.ini.5.html
@@ -25,6 +28,7 @@ readonly RECOVERY_SCRIPT=/usr/local/libexec/xrdp-session-recovery.sh
 readonly RECOVERY_SERVICE=/etc/systemd/system/xrdp-session-recovery.service
 readonly RECOVERY_TIMER=/etc/systemd/system/xrdp-session-recovery.timer
 readonly RECOVERY_TIMER_UNIT=xrdp-session-recovery.timer
+readonly NEEDRESTART_CONFIG=/etc/needrestart/conf.d/zz-xrdp-keep-session.conf
 WORK_DIR=''
 BACKUP_DIR=''
 SERVICE_WORK_STARTED=0
@@ -33,6 +37,126 @@ TEMP_MASKS=()
 log() { printf '\n==> %s\n' "$*"; }
 warn() { printf '\nWARNING: %s\n' "$*" >&2; }
 die() { printf '\nERROR: %s\n' "$*" >&2; exit 1; }
+
+usage() {
+    cat <<'USAGE'
+Usage:
+  sudo bash setup-xrdp-xfce-ubuntu24.sh
+  sudo bash setup-xrdp-xfce-ubuntu24.sh --doctor
+  bash setup-xrdp-xfce-ubuntu24.sh --help
+
+The default mode installs or converges the XRDP + XFCE configuration and
+restarts XRDP. Run it from SSH or a server console, not from the RDP session
+you need to preserve.
+
+--doctor  Read-only health audit; never installs packages or restarts services.
+--help    Show this help.
+USAGE
+}
+
+doctor_result() {
+    local label="$1" status="$2"
+    if [[ "$status" == pass ]]; then
+        printf 'PASS: %s\n' "$label"
+    elif [[ "$status" == warn ]]; then
+        printf 'WARN: %s\n' "$label"
+    else
+        printf 'FAIL: %s\n' "$label"
+        DOCTOR_FAILURES=$((DOCTOR_FAILURES + 1))
+    fi
+}
+
+needrestart_protection_ok() {
+    [[ -s "$NEEDRESTART_CONFIG" ]] && \
+        grep -Fqx '$nrconf{override_rc}{qr(^xrdp\.service$)} = 0;' "$NEEDRESTART_CONFIG" && \
+        grep -Fqx '$nrconf{override_rc}{qr(^xrdp-sesman\.service$)} = 0;' "$NEEDRESTART_CONFIG"
+}
+
+doctor() {
+    local os_id version rdp_list sesman_list disk_free_kib mem_available_kib
+    local xrdp_status sesman_status timer_status
+    DOCTOR_FAILURES=0
+
+    (( EUID == 0 )) || die 'Run --doctor with sudo so listener and service checks are complete.'
+    [[ -r /etc/os-release ]] || die '/etc/os-release is unavailable.'
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    os_id=${ID:-unknown}
+    version=${VERSION_ID:-unknown}
+    printf 'XRDP doctor: %s %s\n' "$os_id" "$version"
+
+    if [[ "$os_id" == ubuntu && "$version" == 24.04 ]]; then
+        doctor_result 'Ubuntu 24.04 detected' pass
+    else
+        doctor_result "Expected Ubuntu 24.04; found $os_id $version" fail
+    fi
+
+    if systemctl is-active --quiet xrdp.service; then xrdp_status=active; else xrdp_status=inactive; fi
+    if systemctl is-active --quiet xrdp-sesman.service; then sesman_status=active; else sesman_status=inactive; fi
+    if systemctl is-active --quiet "$RECOVERY_TIMER_UNIT"; then timer_status=active; else timer_status=inactive; fi
+    doctor_result "xrdp.service is $xrdp_status" "$( [[ "$xrdp_status" == active ]] && printf pass || printf fail )"
+    doctor_result "xrdp-sesman.service is $sesman_status" "$( [[ "$sesman_status" == active ]] && printf pass || printf fail )"
+    doctor_result "$RECOVERY_TIMER_UNIT is $timer_status" "$( [[ "$timer_status" == active ]] && printf pass || printf fail )"
+
+    if needrestart_protection_ok; then
+        doctor_result 'needrestart protection for both XRDP services is installed' pass
+    else
+        doctor_result "needrestart protection is missing or incomplete: $NEEDRESTART_CONFIG" fail
+    fi
+
+    if [[ -s /etc/xrdp/xrdp.ini ]] && \
+       grep -Eq '^port=tcp://127\.0\.0\.1:3389$' /etc/xrdp/xrdp.ini && \
+       grep -Eq '^security_layer=tls$' /etc/xrdp/xrdp.ini; then
+        doctor_result 'XRDP is configured for localhost TLS' pass
+    else
+        doctor_result 'XRDP localhost/TLS settings are missing or changed' fail
+    fi
+    if [[ -s /etc/xrdp/sesman.ini ]] && \
+       grep -Eq '^KillDisconnected=false$' /etc/xrdp/sesman.ini && \
+       grep -Eq '^DisconnectedTimeLimit=0$' /etc/xrdp/sesman.ini && \
+       grep -Eq '^IdleTimeLimit=0$' /etc/xrdp/sesman.ini && \
+       grep -Eq '^Policy=UB$' /etc/xrdp/sesman.ini; then
+        doctor_result 'Disconnected-session retention settings are present' pass
+    else
+        doctor_result 'Disconnected-session retention settings are missing or changed' fail
+    fi
+
+    rdp_list=$(ss -H -ltn 'sport = :3389' 2>/dev/null || true)
+    if [[ "$rdp_list" == *'127.0.0.1:3389'* ]]; then
+        doctor_result 'XRDP listens on 127.0.0.1:3389' pass
+    else
+        doctor_result 'XRDP is not listening on the expected localhost address' fail
+    fi
+    sesman_list=$(ss -H -ltn 'sport = :3350' 2>/dev/null || true)
+    if [[ "$sesman_list" == *'127.0.0.1:3350'* || "$sesman_list" == *'[::1]:3350'* ]]; then
+        doctor_result 'sesman listens only on loopback' pass
+    else
+        doctor_result 'sesman is not listening on the expected loopback address' fail
+    fi
+
+    disk_free_kib=$(df -Pk / | awk 'NR == 2 {print $4}')
+    if [[ "$disk_free_kib" =~ ^[0-9]+$ ]] && (( disk_free_kib >= 2097152 )); then
+        doctor_result "root filesystem has at least 2 GiB free ($((disk_free_kib / 1024 / 1024)) GiB)" pass
+    else
+        doctor_result 'root filesystem has less than 2 GiB free' warn
+    fi
+    mem_available_kib=$(awk '/^MemAvailable:/ {print $2; exit}' /proc/meminfo)
+    if [[ "$mem_available_kib" =~ ^[0-9]+$ ]] && (( mem_available_kib >= 1048576 )); then
+        doctor_result "at least 1 GiB memory is available ($((mem_available_kib / 1024)) MiB)" pass
+    else
+        doctor_result 'less than 1 GiB memory is available; check for OOM risk' warn
+    fi
+    if swapon --show --noheadings 2>/dev/null | grep -q .; then
+        doctor_result 'swap is available' pass
+    else
+        doctor_result 'no swap is configured; memory pressure can kill desktop applications' warn
+    fi
+
+    printf '\nRecent XRDP errors, if any:\n'
+    journalctl -u xrdp.service -u xrdp-sesman.service -p err -n 10 --no-pager 2>/dev/null || true
+    printf '\nDoctor result: %s\n' "$([[ "$DOCTOR_FAILURES" == 0 ]] && printf PASS || printf FAIL)"
+    (( DOCTOR_FAILURES == 0 ))
+}
 
 on_error() {
     local status="$1" line="$2"
@@ -131,7 +255,8 @@ main() {
     install -d -m 0700 "$BACKUP_DIR/files"
     WORK_DIR=$(mktemp -d /tmp/setup-xrdp-xfce.XXXXXX)
     for path in /etc/xrdp /etc/X11/xrdp /etc/pam.d/xrdp-sesman \
-                "$SESSION_SCRIPT" "$RECOVERY_SCRIPT" "$RECOVERY_SERVICE" "$RECOVERY_TIMER"; do
+                "$SESSION_SCRIPT" "$RECOVERY_SCRIPT" "$RECOVERY_SERVICE" \
+                "$RECOVERY_TIMER" "$NEEDRESTART_CONFIG"; do
         backup_path "$path"
     done
     package_state=$(dpkg-query -W -f='${db:Status-Abbrev}\t${binary:Package}\t${Version}\n')
@@ -195,6 +320,20 @@ main() {
     [[ -s /etc/X11/xrdp/xorg.conf ]] || die 'XRDP Xorg configuration is missing.'
     getent passwd xrdp >/dev/null || die 'The xrdp service account is missing.'
     getent group xrdp >/dev/null || die 'The xrdp service group is missing.'
+
+    log 'Protecting the existing desktop session from automatic needrestart actions'
+    install -d -o root -g root -m 0755 /etc/needrestart/conf.d
+    cat > "$WORK_DIR/zz-xrdp-keep-session.conf" <<'NEEDRESTART'
+# Managed by setup-xrdp-xfce-ubuntu24.sh.
+# Do not let needrestart restart XRDP while an unrelated package is installed.
+# XRDP package updates are intentionally applied after the next reboot or a
+# deliberate maintenance-window restart of these two services.
+$nrconf{override_rc}{qr(^xrdp\.service$)} = 0;
+$nrconf{override_rc}{qr(^xrdp-sesman\.service$)} = 0;
+NEEDRESTART
+    install -o root -g root -m 0644 "$WORK_DIR/zz-xrdp-keep-session.conf" \
+        "$NEEDRESTART_CONFIG"
+    needrestart_protection_ok || die 'The needrestart XRDP protection was not written correctly.'
 
     log 'Preparing a dedicated TLS certificate and private key'
     [[ ! -L "$TLS_DIR" ]] || die "$TLS_DIR is a symlink; review it before proceeding."
@@ -293,6 +432,16 @@ now=$(/usr/bin/date +%s)
         --no-pager -q 2>/dev/null || true)
     case "$recent" in
         *'Error connecting to user session'*) ;;
+        *) exit 0 ;;
+    esac
+
+    # Require sesman's matching reconnect event as well. This prevents a
+    # failed first login from restarting xrdp merely because another Xorg
+    # session happens to exist.
+    recent_sesman=$(/usr/bin/journalctl -u xrdp-sesman.service \
+        --since '90 seconds ago' --no-pager -q 2>/dev/null || true)
+    case "$recent_sesman" in
+        *'reconnected session:'*) ;;
         *) exit 0 ;;
     esac
 
@@ -651,6 +800,22 @@ VERIFY
     printf 'create a new backup, and restart XRDP. Log out of RDP before rerunning.\n'
     printf 'Disconnected sessions are retained; session matching ignores window-size changes.\n'
     printf 'A recovery timer restarts only xrdp.service after a failed existing-session reconnect.\n'
+    printf 'Run sudo bash setup-xrdp-xfce-ubuntu24.sh --doctor for a read-only health audit.\n'
 }
 
-main "$@"
+case "${1:-}" in
+    --help|-h)
+        [[ $# == 1 ]] || die '--help does not accept additional arguments.'
+        usage
+        ;;
+    --doctor)
+        [[ $# == 1 ]] || die '--doctor does not accept additional arguments.'
+        doctor
+        ;;
+    '')
+        main "$@"
+        ;;
+    *)
+        die "Unknown argument: $1 (use --help for usage)."
+        ;;
+esac

@@ -66,6 +66,12 @@ session_configured = rewrite(sessions, session_updates)
 assert 'KillDisconnected=false' in session_configured and 'Policy=UB' in session_configured
 assert 'xrdp-session-recovery.sh' in source
 assert 'xrdp-session-recovery.timer' in source
+assert 'zz-xrdp-keep-session.conf' in source
+assert 'override_rc' in source
+assert "xrdp\\.service" in source and "xrdp-sesman\\.service" in source
+assert "reconnected session:" in source
+assert '--doctor' in source and '--help' in source
+assert 'needrestart_protection_ok' in source
 for _ in range(20):
     assert rewrite(configured, updates) == configured
 assert rewrite(fixture.replace('\n', '\r\n').rstrip(), updates) == rewrite(fixture, updates)

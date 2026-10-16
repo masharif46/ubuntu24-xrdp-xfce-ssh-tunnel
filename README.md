@@ -23,6 +23,10 @@ README.md                       Setup, security, and troubleshooting guide
 - Installs a conservative recovery timer which restarts only the XRDP frontend
   after the exact `Error connecting to user session` reconnect failure. It does
   not restart `xrdp-sesman` or intentionally terminate the user's Xorg/XFCE session.
+- Installs a scoped `needrestart` rule so unrelated `apt install` or package
+  upgrades do not automatically restart `xrdp` or `xrdp-sesman` and terminate
+  the desktop session. XRDP package updates remain pending in the running
+  daemons until the next reboot or a deliberate maintenance-window restart.
 - Allows accounts with a UID at or above the system's `UID_MIN` to try Linux password authentication. Existing PAM account rules still apply; root login is disabled. SSH keys alone do not replace the Linux account password at the XRDP login screen.
 - Keeps the XRDP session manager (`sesman`) on loopback. Its listener can appear as `127.0.0.1:3350` or `[::1]:3350`, depending on the Ubuntu XRDP build. Both are local-only; the installer rejects non-loopback addresses. It requires the RDP listener on IPv4 loopback so the tunnel target works.
 - Checks that the RDP listener negotiates TLS before declaring success.
@@ -31,7 +35,7 @@ README.md                       Setup, security, and troubleshooting guide
 
 The installer does **not** change SSH configuration, firewalld rules, UFW rules, display managers, the boot target, or users' home directories. It does not run a distribution upgrade or `apt autoremove`. Each successful rerun creates another backup and restarts XRDP; log out of remote desktop sessions before rerunning.
 
-The recovery timer is best-effort: no script can prevent an ISP outage, an SSH tunnel failure, or an XRDP/Xorg software bug. It is designed to make the observed reconnect failure recover automatically while preserving the desktop session where possible. A timer-triggered frontend restart can briefly disconnect other RDP clients, but it does not normally close their applications.
+The recovery timer and package-restart guard are best-effort: no script can prevent an ISP outage, an SSH tunnel failure, an XRDP/Xorg software bug, an explicit administrator restart, or a reboot. They are designed to keep the desktop session alive when the RDP window or SSH tunnel disconnects, make the observed reconnect failure recover automatically, and prevent unrelated APT work from restarting XRDP. A timer-triggered frontend restart can briefly disconnect other RDP clients, but it does not normally close their applications.
 
 ## Requirements
 
@@ -82,6 +86,31 @@ Open your RDP client and connect to:
 ```
 
 Enter the account's Linux username and password. If prompted for a session type, choose **Xorg**. The client-side port `13389` avoids conflicting with a local RDP service; the XRDP service on the server still uses `3389`.
+
+## Health check and tunnel reconnect
+
+Run the read-only health audit from SSH or the server console:
+
+```bash
+sudo bash setup-xrdp-xfce-ubuntu24.sh --doctor
+```
+
+It does not install packages or restart XRDP. It checks service state, listeners, TLS/session-retention settings, the `needrestart` protection, disk space, memory, and swap. The default installer mode is disruptive because it restarts XRDP; use it only from SSH or a server console.
+
+If Windows loses the tunnel, the server-side desktop session remains retained, but the SSH client itself must reconnect. For an automatic reconnect loop, run this in a Windows PowerShell window and stop it with `Ctrl+C`:
+
+```powershell
+while ($true) {
+    & ssh -N -L 127.0.0.1:13389:127.0.0.1:3389 `
+        -o ExitOnForwardFailure=yes `
+        -o ServerAliveInterval=30 `
+        -o ServerAliveCountMax=3 `
+        sharif@SERVER_LAN_IP
+    Start-Sleep -Seconds 5
+}
+```
+
+Use the same SSH key, port, and username that you normally use. This reconnects the tunnel; it does not log out the Ubuntu desktop session.
 
 ## Re-running and recovery
 
