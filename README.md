@@ -112,6 +112,42 @@ while ($true) {
 
 Use the same SSH key, port, and username that you normally use. This reconnects the tunnel; it does not log out the Ubuntu desktop session.
 
+## Persistent terminal tasks with tmux
+
+Use `tmux` to verify that a terminal task continues while the XRDP window or SSH tunnel is disconnected. Install it from an XFCE Terminal:
+
+```bash
+sudo apt update
+sudo apt install tmux
+```
+
+Create a named tmux session and start an observable task:
+
+```bash
+tmux new -s main
+while true; do date; sleep 2; done
+```
+
+Detach without stopping the task by pressing `Ctrl+B`, releasing both keys, and then pressing `D`. Confirm that the session remains detached:
+
+```bash
+tmux ls
+```
+
+Close or disconnect the Remote Desktop window. Do not choose **Log Out** from XFCE. After reconnecting to the same XRDP desktop, open a terminal and reattach:
+
+```bash
+tmux attach -t main
+```
+
+The timestamps should continue from while the RDP connection was away. Finish the test with `Ctrl+C`, then run `exit` inside tmux. For a convenient create-or-attach command, use:
+
+```bash
+tmux new -As main
+```
+
+This protects terminal tasks from ordinary disconnections. It does not protect them from an XFCE/Xorg crash, an explicit `xrdp-sesman` restart, a reboot, or a system crash.
+
 ## Re-running and recovery
 
 The installer is designed to be safe to rerun after a completed run or an ordinary interrupted run. It avoids duplicate managed settings, reuses a valid certificate, and writes a fresh backup. Package manager errors, interrupted system upgrades, disk errors, and hand-edited configuration can still require troubleshooting.
