@@ -72,6 +72,7 @@ assert "xrdp\\.service" in source and "xrdp-sesman\\.service" in source
 assert "reconnected session:" in source
 assert '--doctor' in source and '--help' in source
 assert 'needrestart_protection_ok' in source
+assert 'sharif' not in source
 for _ in range(20):
     assert rewrite(configured, updates) == configured
 assert rewrite(fixture.replace('\n', '\r\n').rstrip(), updates) == rewrite(fixture, updates)

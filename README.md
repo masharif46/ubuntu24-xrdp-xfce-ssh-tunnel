@@ -74,10 +74,10 @@ ssh -N -L 127.0.0.1:13389:127.0.0.1:3389 \
   -o ExitOnForwardFailure=yes \
   -o ServerAliveInterval=30 \
   -o ServerAliveCountMax=3 \
-  sharif@SERVER_LAN_IP
+  SSH_USER@SERVER_LAN_IP
 ```
 
-If SSH uses a custom port, add `-p PORT` after `ssh`. Use your Ubuntu account name if it is not `sharif`.
+Replace `SSH_USER` with the normal Ubuntu account that you use for the tunnel. If SSH uses a custom port, add `-p PORT` after `ssh`.
 
 Open your RDP client and connect to:
 
@@ -105,7 +105,7 @@ while ($true) {
         -o ExitOnForwardFailure=yes `
         -o ServerAliveInterval=30 `
         -o ServerAliveCountMax=3 `
-        sharif@SERVER_LAN_IP
+        SSH_USER@SERVER_LAN_IP
     Start-Sleep -Seconds 5
 }
 ```
@@ -154,7 +154,7 @@ ssh -N -L 127.0.0.1:13389:127.0.0.1:3389 \
   -o ExitOnForwardFailure=yes \
   -o ServerAliveInterval=30 \
   -o ServerAliveCountMax=3 \
-  sharif@SERVER_LAN_IP
+  SSH_USER@SERVER_LAN_IP
 ```
 
 ## Run the isolated checks

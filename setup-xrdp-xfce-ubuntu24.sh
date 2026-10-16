@@ -781,8 +781,11 @@ VERIFY
             ssh_port=$ssh_server_port
         fi
     fi
-    ssh_user=${SUDO_USER:-sharif}
-    [[ "$ssh_user" != root ]] || ssh_user=sharif
+    ssh_user=${SUDO_USER:-${LOGNAME:-${USER:-}}}
+    if [[ -z "$ssh_user" || "$ssh_user" == root ]]; then
+        ssh_user=SSH_USER
+        warn 'Could not infer a non-root SSH username; replace SSH_USER in the tunnel example.'
+    fi
 
     log 'Installation complete'
     printf 'XRDP package: %s\nConfiguration backup: %s\n' "$installed_version" "$BACKUP_DIR"
