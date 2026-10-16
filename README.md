@@ -18,6 +18,11 @@ README.md                       Setup, security, and troubleshooting guide
 - Binds XRDP to `127.0.0.1:3389`. The port is reachable through an SSH tunnel, not directly from the LAN or Internet.
 - Uses TLS 1.2 or 1.3 with a dedicated self-signed certificate. A matching certificate that is valid for more than 30 days is reused on reruns.
 - Starts XFCE with a separate D-Bus session for each XRDP session.
+- Retains disconnected Xorg sessions, uses TCP keepalive, and matches a user's
+  session without creating another one merely because the RDP window size changed.
+- Installs a conservative recovery timer which restarts only the XRDP frontend
+  after the exact `Error connecting to user session` reconnect failure. It does
+  not restart `xrdp-sesman` or intentionally terminate the user's Xorg/XFCE session.
 - Allows accounts with a UID at or above the system's `UID_MIN` to try Linux password authentication. Existing PAM account rules still apply; root login is disabled. SSH keys alone do not replace the Linux account password at the XRDP login screen.
 - Keeps the XRDP session manager (`sesman`) on loopback. Its listener can appear as `127.0.0.1:3350` or `[::1]:3350`, depending on the Ubuntu XRDP build. Both are local-only; the installer rejects non-loopback addresses. It requires the RDP listener on IPv4 loopback so the tunnel target works.
 - Checks that the RDP listener negotiates TLS before declaring success.
@@ -25,6 +30,8 @@ README.md                       Setup, security, and troubleshooting guide
 - Purges configuration files only for matching XFCE packages that are already removed (`rc` status in dpkg). Their configuration files are backed up first.
 
 The installer does **not** change SSH configuration, firewalld rules, UFW rules, display managers, the boot target, or users' home directories. It does not run a distribution upgrade or `apt autoremove`. Each successful rerun creates another backup and restarts XRDP; log out of remote desktop sessions before rerunning.
+
+The recovery timer is best-effort: no script can prevent an ISP outage, an SSH tunnel failure, or an XRDP/Xorg software bug. It is designed to make the observed reconnect failure recover automatically while preserving the desktop session where possible. A timer-triggered frontend restart can briefly disconnect other RDP clients, but it does not normally close their applications.
 
 ## Requirements
 
@@ -103,6 +110,23 @@ sudo tail -n 80 /var/log/xrdp.log /var/log/xrdp-sesman.log
 ```
 
 Also check that the tunnel is still open, the RDP client is pointed at `127.0.0.1:13389`, the correct Linux password is being used, and SSH permits local port forwarding. Do not open TCP `3389` or `3350` to the network for this setup.
+
+Check the recovery timer with:
+
+```bash
+sudo systemctl status xrdp-session-recovery.timer --no-pager
+sudo journalctl -u xrdp-session-recovery.service -n 30 --no-pager
+```
+
+The client tunnel should use keepalives and remain running:
+
+```bash
+ssh -N -L 127.0.0.1:13389:127.0.0.1:3389 \
+  -o ExitOnForwardFailure=yes \
+  -o ServerAliveInterval=30 \
+  -o ServerAliveCountMax=3 \
+  sharif@SERVER_LAN_IP
+```
 
 ## Run the isolated checks
 

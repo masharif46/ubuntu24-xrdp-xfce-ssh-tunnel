@@ -15,12 +15,13 @@ root = Path(__file__).resolve().parents[1]
 source = (root / 'setup-xrdp-xfce-ubuntu24.sh').read_text()
 blocks = {
     name: re.search(r"<<'" + name + r"'\n(.*?)\n" + name + r"\n", source, re.S).group(1)
-    for name in ('CONFIG', 'VERIFY', 'SESSION')
+    for name in ('CONFIG', 'VERIFY', 'SESSION', 'RECOVERY')
 }
 for name in ('CONFIG', 'VERIFY'):
     compile(blocks[name], f'<{name}>', 'exec')
 subprocess.run(['bash', '-n', str(root / 'setup-xrdp-xfce-ubuntu24.sh')], check=True)
 subprocess.run(['sh', '-n'], input=blocks['SESSION'], text=True, check=True)
+subprocess.run(['sh', '-n'], input=blocks['RECOVERY'], text=True, check=True)
 
 tree = ast.parse(blocks['CONFIG'])
 definitions = [node for node in tree.body if isinstance(node, (ast.Import, ast.ImportFrom, ast.FunctionDef))]
@@ -50,7 +51,8 @@ param=other-one
 param=other-two
 '''
 updates = {'globals': {'port': ['tcp://127.0.0.1:3389'], 'security_layer': ['tls'],
-                       'ssl_protocols': ['TLSv1.2, TLSv1.3']},
+                       'ssl_protocols': ['TLSv1.2, TLSv1.3'],
+                       'tcp_keepalive': ['true'], 'max_bpp': ['32']},
            'xorg': {'param': ['/usr/lib/xorg/Xorg', '-config', 'xrdp/xorg.conf']}}
 configured = rewrite(fixture, updates)
 assert configured.count('port=tcp://127.0.0.1:3389') == 1
@@ -58,6 +60,12 @@ assert 'PORT=9999' not in configured and '; port=4444' in configured
 assert 'unmanaged=true' in configured
 assert '[Xvnc]\nport=-1\nparam=other-one\nparam=other-two' in configured
 assert '[Xorg]\nport=-1\nparam=/usr/lib/xorg/Xorg\nparam=-config\nparam=xrdp/xorg.conf' in configured
+sessions = '''[Sessions]\nKillDisconnected=true\nPolicy=UBD\n'''
+session_updates = {'sessions': {'KillDisconnected': ['false'], 'Policy': ['UB']}}
+session_configured = rewrite(sessions, session_updates)
+assert 'KillDisconnected=false' in session_configured and 'Policy=UB' in session_configured
+assert 'xrdp-session-recovery.sh' in source
+assert 'xrdp-session-recovery.timer' in source
 for _ in range(20):
     assert rewrite(configured, updates) == configured
 assert rewrite(fixture.replace('\n', '\r\n').rstrip(), updates) == rewrite(fixture, updates)

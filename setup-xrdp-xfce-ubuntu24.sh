@@ -3,6 +3,8 @@
 # Run from SSH or the server console: sudo bash setup-xrdp-xfce-ubuntu24.sh
 # Re-running converges to the same managed configuration and reuses valid TLS.
 # Each run backs up configuration and restarts XRDP; log out of RDP first.
+# A small recovery timer restarts only the XRDP frontend after a failed
+# reconnect, preserving the underlying Xorg/XFCE session where possible.
 # No changes to SSH, firewalld, display managers, or users' home directories.
 # No distribution upgrade, apt autoremove, or removal of installed packages.
 # Reference: https://manpages.ubuntu.com/manpages/noble/man5/xrdp.ini.5.html
@@ -19,6 +21,10 @@ readonly TLS_DIR=/etc/xrdp/tls
 readonly TLS_CERT="$TLS_DIR/xrdp.crt"
 readonly TLS_KEY="$TLS_DIR/xrdp.key"
 readonly SESSION_SCRIPT=/usr/local/libexec/xrdp-start-xfce.sh
+readonly RECOVERY_SCRIPT=/usr/local/libexec/xrdp-session-recovery.sh
+readonly RECOVERY_SERVICE=/etc/systemd/system/xrdp-session-recovery.service
+readonly RECOVERY_TIMER=/etc/systemd/system/xrdp-session-recovery.timer
+readonly RECOVERY_TIMER_UNIT=xrdp-session-recovery.timer
 WORK_DIR=''
 BACKUP_DIR=''
 SERVICE_WORK_STARTED=0
@@ -43,6 +49,7 @@ cleanup() {
     set +e
     if (( status != 0 && SERVICE_WORK_STARTED )); then
         # Do not restore an older configuration which might expose port 3389.
+        systemctl stop "$RECOVERY_TIMER_UNIT" >/dev/null 2>&1
         systemctl stop xrdp.service xrdp-sesman.service
         printf '\nInstallation did not complete; XRDP has been stopped.\n' >&2
         printf 'Fix the reported error, then rerun this same script.\n' >&2
@@ -100,7 +107,7 @@ main() {
     [[ -d /run/systemd/system ]] || die 'A running systemd system is required.'
 
     for command in apt-get dpkg dpkg-query systemctl flock ss awk getent \
-                   install cp cmp mktemp runuser; do
+                   install cp cmp mktemp runuser journalctl pgrep logger; do
         command -v "$command" >/dev/null || die "Required command is missing: $command"
     done
     mkdir -p /run/lock
@@ -123,7 +130,8 @@ main() {
     BACKUP_DIR=$(mktemp -d "/var/backups/xrdp-xfce/$(date -u +%Y%m%d-%H%M%S).XXXXXX")
     install -d -m 0700 "$BACKUP_DIR/files"
     WORK_DIR=$(mktemp -d /tmp/setup-xrdp-xfce.XXXXXX)
-    for path in /etc/xrdp /etc/X11/xrdp /etc/pam.d/xrdp-sesman "$SESSION_SCRIPT"; do
+    for path in /etc/xrdp /etc/X11/xrdp /etc/pam.d/xrdp-sesman \
+                "$SESSION_SCRIPT" "$RECOVERY_SCRIPT" "$RECOVERY_SERVICE" "$RECOVERY_TIMER"; do
         backup_path "$path"
     done
     package_state=$(dpkg-query -W -f='${db:Status-Abbrev}\t${binary:Package}\t${Version}\n')
@@ -134,6 +142,7 @@ main() {
 
     log 'Stopping XRDP and temporarily blocking package-triggered starts'
     SERVICE_WORK_STARTED=1
+    systemctl stop "$RECOVERY_TIMER_UNIT" >/dev/null 2>&1 || true
     for unit in xrdp.service xrdp-sesman.service; do
         state=$(systemctl show -p LoadState --value "$unit" 2>/dev/null || true)
         if [[ "$state" == loaded ]]; then
@@ -254,6 +263,82 @@ SESSION
     chown root:root "$SESSION_SCRIPT"
     chmod 0755 "$SESSION_SCRIPT"
 
+    log 'Writing the conservative XRDP reconnect recovery helper'
+    cat > "$WORK_DIR/xrdp-session-recovery.sh" <<'RECOVERY'
+#!/bin/sh
+# Managed by setup-xrdp-xfce-ubuntu24.sh.
+# Recover only the xrdp frontend when it cannot attach to an existing user
+# session. xrdp-sesman and the user's Xorg/XFCE session are left running.
+set -eu
+
+lock=/run/lock/xrdp-session-recovery.lock
+state=/run/xrdp/xrdp-session-recovery.last
+now=$(/usr/bin/date +%s)
+
+(
+    /usr/bin/flock -n 9 || exit 0
+    if [ -r "$state" ]; then
+        last=$(/usr/bin/cat "$state" 2>/dev/null || printf '0')
+        case "$last" in
+            ''|*[!0-9]*) last=0 ;;
+        esac
+        [ "$last" -gt "$now" ] 2>/dev/null && last=0
+        [ $((now - last)) -ge 300 ] || exit 0
+    fi
+
+    /usr/bin/systemctl is-active --quiet xrdp.service || exit 0
+    /usr/bin/systemctl is-active --quiet xrdp-sesman.service || exit 0
+
+    recent=$(/usr/bin/journalctl -u xrdp.service --since '90 seconds ago' \
+        --no-pager -q 2>/dev/null || true)
+    case "$recent" in
+        *'Error connecting to user session'*) ;;
+        *) exit 0 ;;
+    esac
+
+    # Only recover when an Xorg XRDP session still exists. This avoids
+    # restarting xrdp for an ordinary failed first login.
+    /usr/bin/pgrep -af '/usr/lib/xorg/Xorg .*xrdp/xorg.conf' >/dev/null 2>&1 || exit 0
+
+    printf '%s\n' "$now" > "$state"
+    /usr/bin/logger -t xrdp-session-recovery \
+        'restarting xrdp frontend after a failed existing-session reconnect'
+    /usr/bin/systemctl restart xrdp.service
+) 9>"$lock"
+RECOVERY
+    sh -n "$WORK_DIR/xrdp-session-recovery.sh"
+    install -o root -g root -m 0755 "$WORK_DIR/xrdp-session-recovery.sh" \
+        "$RECOVERY_SCRIPT"
+
+    cat > "$WORK_DIR/xrdp-session-recovery.service" <<'SERVICE'
+[Unit]
+Description=Recover XRDP frontend after a failed existing-session reconnect
+After=xrdp.service xrdp-sesman.service
+Wants=xrdp-sesman.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/xrdp-session-recovery.sh
+SERVICE
+    install -o root -g root -m 0644 "$WORK_DIR/xrdp-session-recovery.service" \
+        "$RECOVERY_SERVICE"
+
+    cat > "$WORK_DIR/xrdp-session-recovery.timer" <<'TIMER'
+[Unit]
+Description=Check for XRDP existing-session reconnect failures
+
+[Timer]
+OnBootSec=90s
+OnUnitActiveSec=30s
+AccuracySec=5s
+Unit=xrdp-session-recovery.service
+
+[Install]
+WantedBy=timers.target
+TIMER
+    install -o root -g root -m 0644 "$WORK_DIR/xrdp-session-recovery.timer" \
+        "$RECOVERY_TIMER"
+
     uid_min=$(awk '$1 == "UID_MIN" && !seen {print $2; seen=1}' /etc/login.defs)
     uid_min=${uid_min:-1000}
     [[ "$uid_min" =~ ^[0-9]+$ ]] && (( uid_min >= 1000 )) || \
@@ -338,6 +423,8 @@ def atomic_write(path, text):
 xrdp = {
     'globals': {
         'port': [f'tcp://127.0.0.1:{rdp_port}'],
+        'tcp_nodelay': ['true'], 'tcp_keepalive': ['true'],
+        'max_bpp': ['32'],
         'security_layer': ['tls'],
         'crypt_level': ['high'],
         'certificate': [cert], 'key_file': [key],
@@ -360,6 +447,13 @@ sesman = {
         'AllowRootLogin': ['false'], 'MaxLoginRetry': ['3'],
         'TerminalServerUsers': [''], 'AlwaysGroupCheck': ['false'],
         'AllowAlternateShell': ['false'],
+    },
+    'sessions': {
+        'KillDisconnected': ['false'],
+        'DisconnectedTimeLimit': ['0'],
+        'IdleTimeLimit': ['0'],
+        'Policy': ['UB'],
+        'StartupWaitTime': ['3000'],
     },
     'xorg': {
         'param': ['/usr/lib/xorg/Xorg', '-config', 'xrdp/xorg.conf',
@@ -413,8 +507,11 @@ CONFIG
     systemctl enable xrdp.service
     systemctl restart xrdp-sesman.service
     systemctl restart xrdp.service
+    systemctl enable --now "$RECOVERY_TIMER_UNIT"
     systemctl is-active --quiet xrdp-sesman.service || die 'xrdp-sesman did not start.'
     systemctl is-active --quiet xrdp.service || die 'xrdp did not start.'
+    systemctl is-active --quiet "$RECOVERY_TIMER_UNIT" || \
+        die 'XRDP reconnect recovery timer did not start.'
 
     log 'Checking actual listener addresses and negotiating an RDP TLS connection'
     python3 - "$RDP_PORT" "$SESMAN_PORT" "$TLS_CERT" <<'VERIFY'
@@ -552,6 +649,8 @@ VERIFY
     openssl x509 -in "$TLS_CERT" -noout -fingerprint -sha256
     printf '\nReruns reuse a valid certificate, replace managed settings without duplicates,\n'
     printf 'create a new backup, and restart XRDP. Log out of RDP before rerunning.\n'
+    printf 'Disconnected sessions are retained; session matching ignores window-size changes.\n'
+    printf 'A recovery timer restarts only xrdp.service after a failed existing-session reconnect.\n'
 }
 
 main "$@"
